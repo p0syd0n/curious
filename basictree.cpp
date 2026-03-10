@@ -6,6 +6,7 @@
 #include <print>
 #include <algorithm>
 #include <limits>
+#include <chrono>
 
 #define SQUARE(x) ((x) * (x))
 
@@ -90,9 +91,8 @@ class Dataset {
 };
 
 struct IdealVariance {
-    int feature_index;
-    int dp_index;
-    double threshold_value;
+    int chosen_feature;
+    double chosen_threshold;
 };
 
 struct Sum {
@@ -124,25 +124,27 @@ double traverse(Node& head, std::vector<double>& features) {
 
 
 IdealVariance findIdealVariance(Dataset& dataset) {
-    int chosen_threshold_index = -1;
+    double chosen_threshold = -1;
     int chosen_feature = -1;
     double min_variance = std::numeric_limits<double>::max();
 
     // For each feature
     int left_count;
     int right_count;
+    #pragma omp parallel for
     for (int current_feature = 0; current_feature < dataset.feature_count; current_feature++) {
         // std::println("Looking at feature {:d}", current_feature);
         // Build a vector of indices of the datapoints sorted based on the current feature
-        std::vector<int> indices(dataset.dp_count);
-        std::iota(indices.begin(), indices.end(), 0); // fills with 0,1,2,3...
+        
+        std::vector<std::pair<double, bool>> pairs(dataset.dp_count);
+        for (int i = 0; i < dataset.dp_count; i++) {
+            pairs[i] = {dataset.features.at(current_feature).at(i), dataset.labels.at(i)};
+        }
+        std::sort(pairs.begin(), pairs.end());
 
-        std::sort(indices.begin(), indices.end(), [&](int a, int b) {
-            return dataset.features[current_feature][a] < dataset.features[current_feature][b]; // sort indices by feature value
-        });
         // std::print("[");
-        // for (int index : indices) {
-        //     std::print("{:f}, ",  dataset.features.at(current_feature).at(index));
+        // for (std::pair pear : pairs) {
+        //     std::print("{:f}, ",  pear.first);
         // }
         // std::println("]");
 
@@ -151,7 +153,7 @@ IdealVariance findIdealVariance(Dataset& dataset) {
         Sum labels_squares;
         // Sum it all pre-emptively and store in the right sum to allow for easy manipulation later
         for (int temp = 0; temp < dataset.dp_count;  temp++) {
-            double value = dataset.labels.at(temp);
+            double value = pairs.at(temp).second;
             labels.right += value;
             labels_squares.right += value*value;
         }
@@ -159,9 +161,11 @@ IdealVariance findIdealVariance(Dataset& dataset) {
         for (int feature_split_index = 0; feature_split_index < dataset.dp_count; feature_split_index++) {
             left_count = feature_split_index + 1;
             right_count = dataset.dp_count - left_count;
+            if (left_count != dataset.dp_count && pairs[feature_split_index].first == pairs[feature_split_index+1].first) continue;
+
             // std::println("Splitting feature {:d} with {:d} on the left", current_feature, left_count);
 
-            double value = dataset.labels.at(indices.at(feature_split_index));
+            double value = pairs.at(feature_split_index).second;
             labels.left += value;
             labels.right -=  value;
             labels_squares.left += value*value;
@@ -190,7 +194,7 @@ IdealVariance findIdealVariance(Dataset& dataset) {
             // std::println("({:f})({:f}) + ({:f})({:f})", left_weight,  total_variance_left, right_weight, total_variance_right);
             if (weighted_variance < min_variance) {
                 min_variance = weighted_variance;
-                chosen_threshold_index = indices[feature_split_index];
+                chosen_threshold = pairs.at(feature_split_index).first;
                 chosen_feature = current_feature;
             }
             
@@ -199,8 +203,8 @@ IdealVariance findIdealVariance(Dataset& dataset) {
         }
     }
 
-    std::println("The minimum variance was feature {:d} @ {:d}", chosen_feature, chosen_threshold_index);
-    return IdealVariance{chosen_feature, chosen_threshold_index, dataset.features.at(chosen_feature).at(chosen_threshold_index)};
+    std::println("The minimum variance was feature {:d} @ {:f}", chosen_feature, chosen_threshold);
+    return IdealVariance{chosen_feature, chosen_threshold};
 
 }
 
@@ -221,6 +225,12 @@ int main() {
 
     std::unique_ptr<Dataset> dataset = std::make_unique<Dataset>(120000,15 );
     dataset->label(5, 0.7);
-    // dataset->display();
+
+    auto start = std::chrono::high_resolution_clock::now();
     IdealVariance thebest = findIdealVariance(*dataset);
+    auto end = std::chrono::high_resolution_clock::now();
+
+    std::println("Took {:d}ms",
+        std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count());
 }
+

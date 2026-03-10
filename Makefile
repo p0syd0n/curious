@@ -1,5 +1,5 @@
 CXX      := clang++
-CXXFLAGS := -std=c++23 -Wall -Wextra -Ishared
+CXXFLAGS := -std=c++23 -Wall -Wextra -Ishared -O3 -fopenmp
 SHARED_SRC := $(wildcard shared/*.cpp)
 APPS     := $(patsubst %.cpp, %, $(wildcard *.cpp))
 
