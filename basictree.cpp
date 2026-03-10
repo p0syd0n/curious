@@ -1,4 +1,3 @@
-#include <numeric>
 #include <string>
 #include <variant>
 #include <memory>
@@ -7,6 +6,9 @@
 #include <algorithm>
 #include <limits>
 #include <chrono>
+#include <fstream>
+#include <ranges>
+#include <unordered_map>
 
 #define SQUARE(x) ((x) * (x))
 
@@ -39,8 +41,48 @@ class Dataset {
         std::vector<bool> labels;
 
         std::string filename;
+        bool normalized = false;
+        std::unordered_map<int, std::string> feature_index_to_name;
 
-        Dataset(std::string& filename): filename(filename) {}
+        Dataset(const std::string& filename): filename(filename) {
+            std::println("Creating dataset by file");
+            std::ifstream in(filename);
+            std::string line;
+
+            int data_point = -1;
+            int feature = 0;
+            while (std::getline(in, line)) {
+
+                auto tokens = line
+                    | std::views::split(',')
+                    | std::ranges::to<std::vector<std::string>>();
+
+                    if (data_point == -1) {
+                        features.resize(tokens.size()); 
+                    }
+                    for (auto& token : tokens) {
+                    //std::println("{}", token);
+                    // std::println("Adding  to features[{:d}]",  feature);
+                    if (data_point == -1) {
+                        feature_index_to_name[feature] = token;
+                    } else {
+                       features[feature].push_back(std::stod(token));
+                    };
+                    feature++;
+                }
+
+                // std::println("New line");
+
+
+
+                feature = 0;
+                data_point++;
+            }
+            feature_count = features.size();
+            dp_count = data_point;
+
+        }
+
         Dataset(int dp_count, int feature_count): dp_count(dp_count), feature_count(feature_count) {
             filename = "dummy";
             // Each row is a list of features
@@ -88,6 +130,23 @@ class Dataset {
             }
             std::println("]");
         }
+
+        void display_1(int whichone = 0) {
+            std::println("Showing 1/{:d} datapoints", dp_count);
+            std::print("[");
+            for (int j = 0; j < feature_count; j++) {
+                std::print("{:f}, ", features.at(j).at(whichone));
+            }
+            std::println("]");
+            
+        }
+
+        void show_feature_names() {
+            for (int i = 0; i < feature_count; i++) {
+                std::println("{:s}, ", feature_index_to_name.at(i));
+            }
+        }
+
 };
 
 struct IdealVariance {
@@ -202,10 +261,8 @@ IdealVariance findIdealVariance(Dataset& dataset) {
             
         }
     }
-
     std::println("The minimum variance was feature {:d} @ {:f}", chosen_feature, chosen_threshold);
     return IdealVariance{chosen_feature, chosen_threshold};
-
 }
 
 int main() {
@@ -223,14 +280,19 @@ int main() {
     double result = traverse(*head, features);
     std::println("The result is {:g}", result);
 
-    std::unique_ptr<Dataset> dataset = std::make_unique<Dataset>(120000,15 );
-    dataset->label(5, 0.7);
+    // std::unique_ptr<Dataset> dataset = std::make_unique<Dataset>(120000,15 );
+    // dataset->label(5, 0.7);
 
+    
     auto start = std::chrono::high_resolution_clock::now();
-    IdealVariance thebest = findIdealVariance(*dataset);
+    std::unique_ptr<Dataset> dataset = std::make_unique<Dataset>("data/train.csv"); 
     auto end = std::chrono::high_resolution_clock::now();
+    std::println("Took {:d}ms", std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count());
 
-    std::println("Took {:d}ms",
-        std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count());
+    dataset->display_1(117563); 
+    dataset->show_feature_names();
+    
+
 }
 
+    // IdealVariance thebest = findIdealVariance(*dataset);
