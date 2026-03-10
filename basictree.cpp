@@ -1,14 +1,18 @@
+#include <numeric>
 #include <string>
 #include <variant>
 #include <memory>
 #include <vector>
 #include <print>
+#include <algorithm>
+#include <limits>
+
+#define SQUARE(x) ((x) * (x))
 
 struct Decision;
 struct Leaf;
 
 using Node = std::variant<Decision, Leaf>;
-
 
 struct Decision {
     size_t feature;
@@ -25,6 +29,76 @@ namespace EnumEval {
     template<typename... Ts>
     struct overloaded: Ts... { using Ts::operator()...; };
 }
+
+class Dataset {
+    public:
+        int dp_count;
+        int feature_count;
+        std::vector<std::vector<double>> features;
+        std::vector<bool> labels;
+
+        std::string filename;
+
+        Dataset(std::string& filename): filename(filename) {}
+        Dataset(int dp_count, int feature_count): dp_count(dp_count), feature_count(feature_count) {
+            filename = "dummy";
+            // Each row is a list of features
+            
+            features.resize(feature_count);
+            for (int i = 0; i < feature_count; i++) {
+                features[i].resize(dp_count);
+                for (int j = 0; j < dp_count; j++) {
+                    features[i][j] = (double) rand() / RAND_MAX;
+                }
+            }
+
+        }
+
+        void label_rand() {
+            labels.resize(dp_count);
+            for (int i = 0; i < dp_count; i++) {
+                labels[i] = rand() % 2;
+            }
+        }
+
+        void label(int feature, double threshold) {
+            labels.resize(dp_count);
+            for (int i = 0; i < dp_count; i++) {
+                if (features.at(feature).at(i) < threshold) {
+                    labels[i] = 0;
+                } else {
+                    labels[i] = 1;
+                }
+            }
+        }
+
+        void display() {
+            for (int i = 0; i < feature_count; i++) {
+                std::print("Feature {:d}: [", i);
+                for (int j = 0; j < dp_count; j++) {
+                    std::print("{:f}, ", features.at(i).at(j));
+                }
+                std::println("]");
+            }
+
+            std::print("\n[");
+            for (int i = 0; i < dp_count; i++) {
+                std::print("{:d}, ", labels.at(i));
+            }
+            std::println("]");
+        }
+};
+
+struct IdealVariance {
+    int feature_index;
+    int dp_index;
+    double threshold_value;
+};
+
+struct Sum {
+    double left = 0;
+    double right = 0;
+};
 
 double traverse(Node& head, std::vector<double>& features) {
     std::println("traversing");
@@ -48,6 +122,88 @@ double traverse(Node& head, std::vector<double>& features) {
     }, head);
 }
 
+
+IdealVariance findIdealVariance(Dataset& dataset) {
+    int chosen_threshold_index = -1;
+    int chosen_feature = -1;
+    double min_variance = std::numeric_limits<double>::max();
+
+    // For each feature
+    int left_count;
+    int right_count;
+    for (int current_feature = 0; current_feature < dataset.feature_count; current_feature++) {
+        // std::println("Looking at feature {:d}", current_feature);
+        // Build a vector of indices of the datapoints sorted based on the current feature
+        std::vector<int> indices(dataset.dp_count);
+        std::iota(indices.begin(), indices.end(), 0); // fills with 0,1,2,3...
+
+        std::sort(indices.begin(), indices.end(), [&](int a, int b) {
+            return dataset.features[current_feature][a] < dataset.features[current_feature][b]; // sort indices by feature value
+        });
+        // std::print("[");
+        // for (int index : indices) {
+        //     std::print("{:f}, ",  dataset.features.at(current_feature).at(index));
+        // }
+        // std::println("]");
+
+        // Label sums to calculate residuals
+        Sum labels;
+        Sum labels_squares;
+        // Sum it all pre-emptively and store in the right sum to allow for easy manipulation later
+        for (int temp = 0; temp < dataset.dp_count;  temp++) {
+            double value = dataset.labels.at(temp);
+            labels.right += value;
+            labels_squares.right += value*value;
+        }
+
+        for (int feature_split_index = 0; feature_split_index < dataset.dp_count; feature_split_index++) {
+            left_count = feature_split_index + 1;
+            right_count = dataset.dp_count - left_count;
+            // std::println("Splitting feature {:d} with {:d} on the left", current_feature, left_count);
+
+            double value = dataset.labels.at(indices.at(feature_split_index));
+            labels.left += value;
+            labels.right -=  value;
+            labels_squares.left += value*value;
+            labels_squares.right -= value*value;
+
+            double mean_of_squares_left = labels_squares.left / (left_count);
+            double square_of_means_left = SQUARE(labels.left / (left_count));
+            double total_variance_left = mean_of_squares_left - square_of_means_left;
+
+            double total_variance_right = 0;
+
+            // If the index is at the last index, all of the values are in the left bucket
+            if (right_count != 0) {
+                double mean_of_squares_right = labels_squares.right / (right_count);
+                double square_of_means_right = SQUARE(labels.right / (right_count));
+                total_variance_right = mean_of_squares_right - square_of_means_right;
+            } 
+            // else {
+            //     std::println("End of feature {:d} (everything is in one category)", current_feature);
+            // }
+
+            double left_weight = (double) left_count / dataset.dp_count;
+            double right_weight = (double) right_count / dataset.dp_count;
+
+            double weighted_variance = (left_weight)*total_variance_left + (right_weight)*total_variance_right;
+            // std::println("({:f})({:f}) + ({:f})({:f})", left_weight,  total_variance_left, right_weight, total_variance_right);
+            if (weighted_variance < min_variance) {
+                min_variance = weighted_variance;
+                chosen_threshold_index = indices[feature_split_index];
+                chosen_feature = current_feature;
+            }
+            
+
+            
+        }
+    }
+
+    std::println("The minimum variance was feature {:d} @ {:d}", chosen_feature, chosen_threshold_index);
+    return IdealVariance{chosen_feature, chosen_threshold_index, dataset.features.at(chosen_feature).at(chosen_threshold_index)};
+
+}
+
 int main() {
     std::unique_ptr<Node> branch_0a_0a = std::make_unique<Node>(Leaf{60});
     std::unique_ptr<Node> branch_0a_0b = std::make_unique<Node>(Leaf{-60});
@@ -62,4 +218,9 @@ int main() {
     std::println("Created structure, parsing");
     double result = traverse(*head, features);
     std::println("The result is {:g}", result);
+
+    std::unique_ptr<Dataset> dataset = std::make_unique<Dataset>(120000,15 );
+    dataset->label(5, 0.7);
+    // dataset->display();
+    IdealVariance thebest = findIdealVariance(*dataset);
 }
