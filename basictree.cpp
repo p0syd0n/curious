@@ -87,7 +87,7 @@ class Dataset {
         vector<bool> labels;
 
         string filename;
-        shared_ptr<NormMeta> normalization = make_shared<NormMeta>();
+        shared_ptr<NormMeta> normalization;
         bool normalized = false;
         bool labelled = false;
         unordered_map<string, int> feature_index_to_name;
@@ -204,7 +204,6 @@ class Dataset {
             }
             println("]");
         }
-
 
         void display_1_feature(int whichone) {
             print("[");
@@ -323,27 +322,27 @@ struct Sum {
     double right = 0;
 };
 
-double traverse(Node& head, vector<double>& features) {
-    println("traversing");
+// double traverse(Node& head, Dataset& dataset) {
+//     println("traversing");
 
-    return visit(EnumEval::overloaded{
-        [&features](Decision& decision) {
-            println("It was a decision node");
-            if (features.at(decision.feature) < decision.threshold) {
-                println("We go down  the left line");
-                return traverse(*decision.left, features);
-            } else {
-                println("We go down  the right line");
-                return traverse(*decision.right, features);
-            }
-        },
-        [](Leaf& leaf) {
-            println("Yup it ");
+//     return visit(EnumEval::overloaded{
+//         [features=&dataset.features](Decision& decision) {
+//             println("It was a decision node");
+//             if (features->at(decision.feature) < decision.threshold) {
+//                 println("We go down  the left line");
+//                 return traverse(*decision.left, features);
+//             } else {
+//                 println("We go down  the right line");
+//                 return traverse(*decision.right, features);
+//             }
+//         },
+//         [](Leaf& leaf) {
+//             println("Yup it ");
 
-            return leaf.residual;
-        },
-    }, head);
-}
+//             return leaf.residual;
+//         },
+//     }, head);
+// }
 
 
 IdealVariance findIdealVariance(Dataset& dataset) {
@@ -352,10 +351,11 @@ IdealVariance findIdealVariance(Dataset& dataset) {
     double min_variance = numeric_limits<double>::max();
 
     // For each feature
-    int left_count;
-    int right_count;
+
     #pragma omp parallel for
     for (int current_feature = 0; current_feature < dataset.feature_count; current_feature++) {
+        int left_count;
+        int right_count;
         // println("Looking at feature {:d}", current_feature);
         // Build a vector of indices of the datapoints sorted based on the current feature
         
@@ -416,10 +416,13 @@ IdealVariance findIdealVariance(Dataset& dataset) {
 
             double weighted_variance = (left_weight)*total_variance_left + (right_weight)*total_variance_right;
             // println("({:f})({:f}) + ({:f})({:f})", left_weight,  total_variance_left, right_weight, total_variance_right);
-            if (weighted_variance < min_variance) {
-                min_variance = weighted_variance;
-                chosen_threshold = pairs.at(feature_split_index).first;
-                chosen_feature = current_feature;
+            #pragma omp critical
+            {
+                if (weighted_variance < min_variance) {
+                    min_variance = weighted_variance;
+                    chosen_threshold = pairs.at(feature_split_index).first;
+                    chosen_feature = current_feature;
+                }
             }
             
 
@@ -429,7 +432,7 @@ IdealVariance findIdealVariance(Dataset& dataset) {
     println("The minimum variance was feature {:d} @ {:f}", chosen_feature, chosen_threshold);
     return IdealVariance{chosen_feature, chosen_threshold};
 }
-
+ 
 int main() {
     unique_ptr<Node> branch_0a_0a = make_unique<Node>(Leaf{60});
     unique_ptr<Node> branch_0a_0b = make_unique<Node>(Leaf{-60});
@@ -442,8 +445,8 @@ int main() {
 
     vector<double> features = {0.1, 0.9, 0.9};
     println("Created structure, parsing");
-    double result = traverse(*head, features);
-    println("The result is {:g}", result);
+    // double result = traverse(*head, features);
+    // println("The result is {:g}", result);
 
     // unique_ptr<Dataset> dataset = make_unique<Dataset>(120000,15 );
     // dataset->label(5, 0.7);
