@@ -13,6 +13,8 @@
 #include <utility>
 
 #define SQUARE(x) ((x) * (x))
+#define LEAF_SIZE 5
+#define MAX_DEPTH 3
 
 using namespace std;
 
@@ -24,12 +26,12 @@ using Node = variant<Decision, Leaf>;
 struct Decision {
     size_t feature;
     double threshold;
-    unique_ptr<Node> left;
-    unique_ptr<Node> right;
+    shared_ptr<Node> left;
+    shared_ptr<Node> right;
 };
 
 struct Leaf {
-    double residual;
+    double mean_label;
 };
 
 // Normalization metadata
@@ -42,6 +44,23 @@ namespace EnumEval {
     template<typename... Ts>
     struct overloaded: Ts... { using Ts::operator()...; };
 }
+
+
+struct IdealVariance {
+    int chosen_feature;
+    double chosen_threshold;
+    float left_count_vs_total;
+};
+
+class BureauOfComplaints {
+    static vector<string> important_registry;
+    public:
+        static int complain(const string& important_complaint) {
+            important_registry.push_back(important_complaint);
+            return 0;
+        }
+};
+vector<string> BureauOfComplaints::important_registry;
 
 class Dataset {
         void prep_normalization() {
@@ -84,7 +103,7 @@ class Dataset {
         int dp_count;
         int feature_count;
         vector<vector<double>> features;
-        vector<bool> labels;
+        vector<double> labels;
 
         string filename;
         shared_ptr<NormMeta> normalization;
@@ -129,7 +148,7 @@ class Dataset {
                 feature = 0;
                 data_point++;
             }
-            feature_count = features.size();
+            feature_count = (int) features.size();
             dp_count = data_point;
             println("Dataset created by file {:s}", filename);
         }
@@ -200,7 +219,7 @@ class Dataset {
 
             print("\n[");
             for (int i = 0; i < dp_count; i++) {
-                print("{:d}, ", labels.at(i));
+                print("{:f}, ", labels.at(i));
             }
             println("]");
         }
@@ -228,7 +247,7 @@ class Dataset {
             return feature_names;
         }
 
-        const vector<bool>& get_labels() {
+        const vector<double>& get_labels() {
             return labels;
         }
 
@@ -265,7 +284,7 @@ class Dataset {
                 );
                 println("{:d}", features.at(i).size());
             }
-            const vector<bool>& other_labels = other.get_labels();
+            const vector<double>& other_labels = other.get_labels();
             labels.insert(labels.end(), other_labels.begin(), other_labels.end());
             dp_count += other.dp_count;
         }
@@ -302,6 +321,40 @@ class Dataset {
             return test;
         }
 
+        pair<shared_ptr<Dataset>, shared_ptr<Dataset>> split_by_criteria(const IdealVariance& criteria) {
+            shared_ptr<Dataset> left  = make_shared<Dataset>(*this);
+            shared_ptr<Dataset> right = make_shared<Dataset>(*this);
+
+            left->features.resize(feature_count);
+            right->features.resize(feature_count);
+            for (int f = 0; f < feature_count; f++) {
+                left->features[f].clear();
+                right->features[f].clear();
+            }
+
+            left->labels.clear();
+            right->labels.clear();
+
+            for (int i = 0; i < dp_count; i++) {
+                if (features[criteria.chosen_feature][i] < criteria.chosen_threshold) {
+                    for (int f = 0; f < feature_count; f++) {
+                        left->features[f].push_back(features[f][i]);
+                    }
+                    if (labelled) left->labels.push_back(labels[i]);
+                } else {
+                    for (int f = 0; f < feature_count; f++) {
+                        right->features[f].push_back(features[f][i]);
+                    }
+                    if (labelled) right->labels.push_back(labels[i]);
+                }
+            }
+
+            left->dp_count  = (int) left->features[0].size();
+            right->dp_count = (int) right->features[0].size();
+
+            return {std::move(left), std::move(right)};
+        }
+
         void normalize() {
             if (training_flag) {
                 prep_normalization();
@@ -312,10 +365,6 @@ class Dataset {
         }
 };
 
-struct IdealVariance {
-    int chosen_feature;
-    double chosen_threshold;
-};
 
 struct Sum {
     double left = 0;
@@ -349,6 +398,9 @@ IdealVariance findIdealVariance(Dataset& dataset) {
     double chosen_threshold = -1;
     int chosen_feature = -1;
     double min_variance = numeric_limits<double>::max();
+    int dataset_size = dataset.dp_count;
+    int optimal_left_count = 0; // To keep track of left-count-vs-total later
+
 
     // For each feature
 
@@ -419,6 +471,7 @@ IdealVariance findIdealVariance(Dataset& dataset) {
             #pragma omp critical
             {
                 if (weighted_variance < min_variance) {
+                    optimal_left_count = left_count;
                     min_variance = weighted_variance;
                     chosen_threshold = pairs.at(feature_split_index).first;
                     chosen_feature = current_feature;
@@ -430,55 +483,118 @@ IdealVariance findIdealVariance(Dataset& dataset) {
         }
     }
     println("The minimum variance was feature {:d} @ {:f}", chosen_feature, chosen_threshold);
-    return IdealVariance{chosen_feature, chosen_threshold};
+    return IdealVariance{chosen_feature, chosen_threshold, (float)optimal_left_count/(float)dataset_size};
 }
- 
-int main() {
+
+template<typename F>
+auto loki(F lambda) {
+    auto start = chrono::high_resolution_clock::now();
+    auto result = lambda();  // just use auto here
+    auto end = chrono::high_resolution_clock::now();
+    return make_pair(std::move(result), chrono::duration_cast<chrono::milliseconds>(end-start).count());
+}
+
+int manual_tree_test() {
     unique_ptr<Node> branch_0a_0a = make_unique<Node>(Leaf{60});
     unique_ptr<Node> branch_0a_0b = make_unique<Node>(Leaf{-60});
 
 
-    unique_ptr<Node> branch_0a = make_unique<Node>(Decision{1, 0.5, move(branch_0a_0a), move(branch_0a_0b)});
+    unique_ptr<Node> branch_0a = make_unique<Node>(Decision{1, 0.5, std::move(branch_0a_0a), std::move(branch_0a_0b)});
 
     unique_ptr<Node> branch_0b = make_unique<Node>(Leaf{30});
-    unique_ptr<Node> head = make_unique<Node>(Decision{0, 0.5, move(branch_0a), move(branch_0b)});
+    unique_ptr<Node> head = make_unique<Node>(Decision{0, 0.5, std::move(branch_0a), std::move(branch_0b)});
 
     vector<double> features = {0.1, 0.9, 0.9};
     println("Created structure, parsing");
+    return 1;
+}
+
+int variance_n_p_hp(int dp_count, int feature_count) {
+    unique_ptr<Dataset> dataset = make_unique<Dataset>(dp_count,feature_count);
+    dataset->label(5, 0.7);
+    auto [ideal_variance, time] = loki(
+        [&dataset]() {
+                 return findIdealVariance(*dataset);   
+        }
+    );
+    println("One variance on tree {:d} data points and {:d} features takes {:d}ms", dp_count, feature_count, time);
+    return 1;
+}
+
+shared_ptr<Node> build_tree(Dataset& dataset, int current_depth=1) {
+    if (dataset.dp_count < LEAF_SIZE || current_depth == MAX_DEPTH) {
+        double current_mean_label = 0;
+        for (double label : dataset.labels) {
+            current_mean_label += label;
+        }
+        current_mean_label /= dataset.dp_count;
+        return make_shared<Node>(
+            Leaf{ 
+                current_mean_label
+            }
+        );
+    }
+    IdealVariance ideal_variance = findIdealVariance(dataset);
+    auto [left_dataset, right_dataset] = dataset.split_by_criteria(ideal_variance);
+    shared_ptr<Node> new_left = build_tree(*left_dataset, current_depth+1);
+    shared_ptr<Node> new_right = build_tree(*right_dataset, current_depth+1);
+    shared_ptr<Node> new_decision = make_shared<Node>(
+        Decision { 
+            (size_t)ideal_variance.chosen_feature,
+            ideal_variance.chosen_threshold,
+            new_left,
+            new_right
+        }
+    );
+    return new_decision;    
+}
+int main() {
+
     // double result = traverse(*head, features);
     // println("The result is {:g}", result);
 
-    // unique_ptr<Dataset> dataset = make_unique<Dataset>(120000,15 );
-    // dataset->label(5, 0.7);
+  //  unique_ptr<Dataset> dataset = make_unique<Dataset>("data/fragmented/1.csv"); 
 
+    auto [dataset, time] = loki(
+        [](){
+        return make_unique<Dataset>("data/fragmented/1.csv"); 
+        }
+    );
+    println("Loading one dataset [:d ms]", time);
     
-    auto start = chrono::high_resolution_clock::now();
-    unique_ptr<Dataset> dataset = make_unique<Dataset>("data/fragmented/1.csv"); 
-    auto end = chrono::high_resolution_clock::now();
-    println("Took {:d}ms", chrono::duration_cast<chrono::milliseconds>(end-start).count());
-
     dataset->display_1(43571); 
+
     dataset->show_feature_names();
     // dataset->label_by_feature("Class");
 
 
     unique_ptr<Dataset> test_dataset = make_unique<Dataset>("data/fragmented/2.csv");
+    println("Loaded test dataset");
     println("Test dataset has {:d} datapoints", test_dataset->dp_count);
     println("OG dataset has {:d} ({:d}) datapoints", dataset->dp_count, dataset->features.at(0).size());
 
     dataset->combine(*test_dataset);
+    println("Combined datasets");
     println("{:d}", dataset->dp_count);
     dataset->display_1(78376);
 
-    unique_ptr<Dataset> test_set = dataset->split(0.8);
+    float train_percent = 0.8;
+    unique_ptr<Dataset> test_set = dataset->split(train_percent);
+    println("Split dataset to train and test at {:f}%", train_percent*100);
     dataset->label_by_feature("Class");
+    println("Labelled train dataset by class");
     test_set->label_by_feature("Class");
+    println("Labelled test dataset by class");
 
     dataset->normalize();
-    println("Normalized dataset");
+    println("Normalized train dataset");
     test_set->normalization = dataset->normalization; // NOW share the pointer
     test_set->normalize();
+    println("Normalized test dataset");
     test_set->display_1(15);
+
+    shared_ptr<Node> tree = build_tree(*dataset);
+
     // int class_index = dataset->feature_index_to_name.at("Class");
     // println("Class index: {:d}", class_index);
     // for (int i = 0; i < dataset->dp_count; i++) {
