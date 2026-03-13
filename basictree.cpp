@@ -1,5 +1,7 @@
 #include <cmath>
+#include <numeric>
 #include <string>
+#include <utility>
 #include <variant>
 #include <memory>
 #include <vector>
@@ -22,6 +24,10 @@ struct Decision;
 struct Leaf;
 
 using Node = variant<Decision, Leaf>;
+class Dataset;
+
+shared_ptr<Node> build_tree(Dataset&, int);
+double traverse(Node&, const vector<double>&);
 
 struct Decision {
     size_t feature;
@@ -103,7 +109,9 @@ class Dataset {
         int dp_count;
         int feature_count;
         vector<vector<double>> features;
-        vector<double> labels;
+        vector<double> true_labels;
+        vector<double> residuals;
+        vector<double> predictions;
 
         string filename;
         shared_ptr<NormMeta> normalization;
@@ -167,6 +175,20 @@ class Dataset {
 
         }
 
+        void set_initial_prediction() {
+            if (!labelled) {
+                println("Only calculate initial predictions on labelled data!");
+                exit(-1);
+            }
+            double true_label_mean  = accumulate(true_labels.begin(), true_labels.end(), 0)/dp_count;
+            predictions.resize(dp_count);
+            residuals.resize(dp_count);
+            for (int dp_index = 0; dp_index < dp_count; dp_index++) {
+                predictions.at(dp_index) = true_label_mean;
+                residuals.at(dp_index) = true_labels.at(dp_index) - true_label_mean;
+            }
+        }
+
         void label_by_feature(const string& label_feature) {
             if (!feature_index_to_name.contains(label_feature)) {
                println("The label doesn't exist in the data.");
@@ -175,37 +197,43 @@ class Dataset {
             int feature_index = feature_index_to_name.at(label_feature);
             // println("We will be using values from feature index {:d}", feature_index);
             // display_1_feature(feature_index);
-            labels.resize(dp_count);
+            true_labels.resize(dp_count);
             for (int i = 0; i < dp_count; i++) {
-                labels[i] = (bool) features[feature_index][i];       
+                true_labels[i] = (bool) features[feature_index][i];       
             }
             feature_index_to_name.erase(label_feature);
             features.erase(features.begin() + feature_index);
             feature_count--;
             labelled = true;
             println("Labelled dataset by feature {:s}", label_feature);
+            set_initial_prediction();
+            println("Set dataset initial predictions and residuals");
         }
 
         void label_rand() {
-            labels.resize(dp_count);
+            true_labels.resize(dp_count);
             for (int i = 0; i < dp_count; i++) {
-                labels[i] = rand() % 2;
+                true_labels[i] = rand() % 2;
             }
 
             labelled = true;
+            set_initial_prediction();
+            println("Set dataset initial predictions and residuals");
         }
 
         void label(int feature, double threshold) {
-            labels.resize(dp_count);
+            true_labels.resize(dp_count);
             for (int i = 0; i < dp_count; i++) {
                 if (features.at(feature).at(i) < threshold) {
-                    labels[i] = 0;
+                    true_labels[i] = 0;
                 } else {
-                    labels[i] = 1;
+                    true_labels[i] = 1;
                 }
             }
 
             labelled = true;
+            set_initial_prediction();
+            println("Set dataset initial predictions and residuals");
         }
 
         void display() {
@@ -219,7 +247,7 @@ class Dataset {
 
             print("\n[");
             for (int i = 0; i < dp_count; i++) {
-                print("{:f}, ", labels.at(i));
+                print("{:f}, ", true_labels.at(i));
             }
             println("]");
         }
@@ -248,7 +276,7 @@ class Dataset {
         }
 
         const vector<double>& get_labels() {
-            return labels;
+            return true_labels;
         }
 
         void display_1(int whichone = 0) {
@@ -285,11 +313,11 @@ class Dataset {
                 println("{:d}", features.at(i).size());
             }
             const vector<double>& other_labels = other.get_labels();
-            labels.insert(labels.end(), other_labels.begin(), other_labels.end());
+            true_labels.insert(true_labels.end(), other_labels.begin(), other_labels.end());
             dp_count += other.dp_count;
         }
 
-        unique_ptr<Dataset> split(float train_percent) {
+        shared_ptr<Dataset> split(float train_percent) {
             if (train_percent < 0 || train_percent > 1) {
                 println("Please enter a valid percentage (0.XX)");
                 exit(-1);
@@ -298,7 +326,7 @@ class Dataset {
             int test_count = dp_count - train_count;
             println("{:d} lines of training data", train_count);
 
-            unique_ptr<Dataset> test  = make_unique<Dataset>(*this);  // copies everything
+            shared_ptr<Dataset> test  = make_unique<Dataset>(*this);  // copies everything
 
             // then overwrite just the parts that differ
             test->features.resize(feature_count);
@@ -332,20 +360,20 @@ class Dataset {
                 right->features[f].clear();
             }
 
-            left->labels.clear();
-            right->labels.clear();
+            left->true_labels.clear();
+            right->true_labels.clear();
 
             for (int i = 0; i < dp_count; i++) {
                 if (features[criteria.chosen_feature][i] < criteria.chosen_threshold) {
                     for (int f = 0; f < feature_count; f++) {
                         left->features[f].push_back(features[f][i]);
                     }
-                    if (labelled) left->labels.push_back(labels[i]);
+                    if (labelled) left->true_labels.push_back(true_labels[i]);
                 } else {
                     for (int f = 0; f < feature_count; f++) {
                         right->features[f].push_back(features[f][i]);
                     }
-                    if (labelled) right->labels.push_back(labels[i]);
+                    if (labelled) right->true_labels.push_back(true_labels[i]);
                 }
             }
 
@@ -371,27 +399,89 @@ struct Sum {
     double right = 0;
 };
 
-// double traverse(Node& head, Dataset& dataset) {
-//     println("traversing");
+struct GradientBoosterMetadata {
+    float learning_rate;
+    int max_leaf_size;
+    int max_depth;
+    int num_trees;
+};
 
-//     return visit(EnumEval::overloaded{
-//         [features=&dataset.features](Decision& decision) {
-//             println("It was a decision node");
-//             if (features->at(decision.feature) < decision.threshold) {
-//                 println("We go down  the left line");
-//                 return traverse(*decision.left, features);
-//             } else {
-//                 println("We go down  the right line");
-//                 return traverse(*decision.right, features);
-//             }
-//         },
-//         [](Leaf& leaf) {
-//             println("Yup it ");
+class GradientBooster {
+    vector<shared_ptr<Node>> trees;
+    shared_ptr<Dataset> dataset;
+    
+    public:
+        float learning_rate;
+        int max_leaf_size;
+        int max_depth;
+        int num_trees;
+    
+        GradientBooster(const GradientBoosterMetadata& gbm, shared_ptr<Dataset> dataset): 
+            dataset(std::move(dataset)), 
+            learning_rate(gbm.learning_rate), 
+            max_leaf_size(gbm.max_leaf_size), 
+            max_depth(gbm.max_depth),
+            num_trees(gbm.num_trees)
+            {
+                println("Gradient Booster Initializing");
+        }
 
-//             return leaf.residual;
-//         },
-//     }, head);
-// }
+        void generate(int current_tree_count = 1) {
+            shared_ptr<Node> current_tree = build_tree(*dataset, 1);
+            println("Built one tree");
+            trees.push_back(current_tree);
+            int feature_count = dataset->feature_count;
+            int dp_count = dataset->dp_count;
+
+            println("About to run data points through it");
+
+            for (int dp_index = 0; dp_index < dp_count; dp_index++) {
+               //   println("\n\nData point {:d} being evaluated", dp_index+1);
+                vector<double> features_temp(feature_count);
+                for (int feature_index = 0; feature_index < feature_count; feature_index++) {
+                    //println("About to access the data set at feature  {:d} of dp {:d}", feature_)
+                    features_temp.push_back(dataset->features.at(feature_index).at(dp_index));
+                }
+                // println("features for that one data point collected collected");
+                double leaf_value = traverse(*current_tree, features_temp);
+                //  println("===============\nTRAVERSED\n======================");
+                double new_prediction =  learning_rate*leaf_value;
+                dataset->predictions.at(dp_index) += new_prediction;
+                dataset->residuals.at(dp_index) = dataset->true_labels.at(dp_index) - new_prediction;
+            }
+            println("Evaluated data points at tree {:d}", current_tree_count);
+
+            if (current_tree_count == num_trees) {
+                return;
+            }
+
+            generate(current_tree_count+1);
+        }
+};
+
+// day 4, hour 15 + ,: amaz
+
+double traverse(Node& head, const vector<double>& features) {
+    // println("traversing");
+
+    return visit(EnumEval::overloaded{
+        [features=features](Decision& decision) {
+            // println("It was a decision node");
+            if (features.at(decision.feature) < decision.threshold) {
+                // println("We go down  the left line");
+                return traverse(*decision.left, features);
+            } else {
+                //  println("We go down  the right line");
+                return traverse(*decision.right, features);
+            }
+        },
+        [](Leaf& leaf) {
+           //  println("Yup it ");
+
+            return leaf.mean_label;
+        },
+    }, head);
+}
 
 
 IdealVariance findIdealVariance(Dataset& dataset) {
@@ -413,7 +503,7 @@ IdealVariance findIdealVariance(Dataset& dataset) {
         
         vector<pair<double, bool>> pairs(dataset.dp_count);
         for (int i = 0; i < dataset.dp_count; i++) {
-            pairs[i] = {dataset.features.at(current_feature).at(i), dataset.labels.at(i)};
+            pairs[i] = {dataset.features.at(current_feature).at(i), dataset.residuals.at(i)};
         }
         sort(pairs.begin(), pairs.end());
 
@@ -482,7 +572,7 @@ IdealVariance findIdealVariance(Dataset& dataset) {
             
         }
     }
-    println("The minimum variance was feature {:d} @ {:f}", chosen_feature, chosen_threshold);
+    // println("The minimum variance was feature {:d} @ {:f}", chosen_feature, chosen_threshold);
     return IdealVariance{chosen_feature, chosen_threshold, (float)optimal_left_count/(float)dataset_size};
 }
 
@@ -522,10 +612,12 @@ int variance_n_p_hp(int dp_count, int feature_count) {
 }
 
 shared_ptr<Node> build_tree(Dataset& dataset, int current_depth=1) {
+    // Leaf base case
     if (dataset.dp_count < LEAF_SIZE || current_depth == MAX_DEPTH) {
+        // Calculate the mean residual
         double current_mean_label = 0;
-        for (double label : dataset.labels) {
-            current_mean_label += label;
+        for (double residual : dataset.residuals) {
+            current_mean_label += residual;
         }
         current_mean_label /= dataset.dp_count;
         return make_shared<Node>(
@@ -534,10 +626,14 @@ shared_ptr<Node> build_tree(Dataset& dataset, int current_depth=1) {
             }
         );
     }
+    // Find the ideal split and split the dataset
     IdealVariance ideal_variance = findIdealVariance(dataset);
     auto [left_dataset, right_dataset] = dataset.split_by_criteria(ideal_variance);
+
+    // Build left and right trees based on their datasets
     shared_ptr<Node> new_left = build_tree(*left_dataset, current_depth+1);
     shared_ptr<Node> new_right = build_tree(*right_dataset, current_depth+1);
+
     shared_ptr<Node> new_decision = make_shared<Node>(
         Decision { 
             (size_t)ideal_variance.chosen_feature,
@@ -548,6 +644,7 @@ shared_ptr<Node> build_tree(Dataset& dataset, int current_depth=1) {
     );
     return new_decision;    
 }
+
 int main() {
 
     // double result = traverse(*head, features);
@@ -557,7 +654,7 @@ int main() {
 
     auto [dataset, time] = loki(
         [](){
-        return make_unique<Dataset>("data/fragmented/1.csv"); 
+        return make_shared<Dataset>("data/fragmented/1.csv"); 
         }
     );
     println("Loading one dataset [:d ms]", time);
@@ -568,7 +665,7 @@ int main() {
     // dataset->label_by_feature("Class");
 
 
-    unique_ptr<Dataset> test_dataset = make_unique<Dataset>("data/fragmented/2.csv");
+    shared_ptr<Dataset> test_dataset = make_shared<Dataset>("data/fragmented/2.csv");
     println("Loaded test dataset");
     println("Test dataset has {:d} datapoints", test_dataset->dp_count);
     println("OG dataset has {:d} ({:d}) datapoints", dataset->dp_count, dataset->features.at(0).size());
@@ -579,7 +676,7 @@ int main() {
     dataset->display_1(78376);
 
     float train_percent = 0.8;
-    unique_ptr<Dataset> test_set = dataset->split(train_percent);
+    shared_ptr<Dataset> test_set = dataset->split(train_percent);
     println("Split dataset to train and test at {:f}%", train_percent*100);
     dataset->label_by_feature("Class");
     println("Labelled train dataset by class");
@@ -594,6 +691,10 @@ int main() {
     test_set->display_1(15);
 
     shared_ptr<Node> tree = build_tree(*dataset);
+    GradientBoosterMetadata md{0.01, 10, 3, 100};
+    GradientBooster gb(md, dataset);
+    gb.generate();
+
 
     // int class_index = dataset->feature_index_to_name.at("Class");
     // println("Class index: {:d}", class_index);
@@ -604,4 +705,5 @@ int main() {
     // }
 }
 
+//int 
     // IdealVariance thebest = findIdealVariance(*dataset);

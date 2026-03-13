@@ -2,3 +2,4 @@ main
 taketwo
 basictree
 *.csv
+*log*
