@@ -3,3 +3,6 @@ taketwo
 basictree
 *.csv
 *log*
+data/
+output/
+venv

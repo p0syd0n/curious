@@ -1,5 +1,6 @@
 #include <cmath>
 #include <numeric>
+#include <random>
 #include <string>
 #include <utility>
 #include <variant>
@@ -13,12 +14,44 @@
 #include <ranges>
 #include <unordered_map>
 #include <utility>
+#include <stdexcept>
 
 #define SQUARE(x) ((x) * (x))
 #define LEAF_SIZE 5
 #define MAX_DEPTH 3
+#define LAMBDA 1
+#define LEARNING_RATE 0.01
+#define NUM_TREES 1000
+#define LOG_FILE "log.json"
+
+#define SIGMOID(raw) (1.0 / (1.0 + exp(-raw)))
+
+#define TREEGENSTATS_FIELDS     \
+    SCALAR(int,    depth)       \
+    SCALAR(int,    num_leaves)  \
+    SCALAR(int,    num_decisions) \
+    SCALAR(double, mean_leaf_value) \
+    SCALAR(double, mean_variance) \
+    SCALAR(double, MSE) \
+    SCALAR(double, running_accuracy)
+
+#define FEATUREDATA_FIELDS \
+    VEC_SCALAR(double, feature_importance)
+
+#define TRAININGLOG_FIELDS \
+    STRUCT_ARRAY(TreeGenStats,  tree_stats)   \
+    NESTED_STRUCT(FeatureData,  feature_data)
 
 using namespace std;
+
+
+void appendToFile(const std::string& filepath, const std::string& text) {
+    std::ofstream file(filepath, std::ios::app);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file: " + filepath);
+    }
+    file << text;
+}
 
 struct Decision;
 struct Leaf;
@@ -51,11 +84,13 @@ namespace EnumEval {
     struct overloaded: Ts... { using Ts::operator()...; };
 }
 
-
 struct IdealVariance {
     int chosen_feature;
     double chosen_threshold;
     float left_count_vs_total;
+    int left_count;
+    double total_weighted_variance;
+    pair<double, double> variances;
 };
 
 class BureauOfComplaints {
@@ -67,6 +102,7 @@ class BureauOfComplaints {
         }
 };
 vector<string> BureauOfComplaints::important_registry;
+
 
 class Dataset {
         void prep_normalization() {
@@ -119,6 +155,7 @@ class Dataset {
         bool labelled = false;
         unordered_map<string, int> feature_index_to_name;
         bool training_flag = true;
+        double initial_prediction;
 
         // Dataset(bool training_flag = true): training_flag(training_flag) {}
 
@@ -180,12 +217,14 @@ class Dataset {
                 println("Only calculate initial predictions on labelled data!");
                 exit(-1);
             }
-            double true_label_mean  = accumulate(true_labels.begin(), true_labels.end(), 0)/dp_count;
+            double true_label_mean  = accumulate(true_labels.begin(), true_labels.end(), 0.0)/dp_count;
             predictions.resize(dp_count);
             residuals.resize(dp_count);
+
+            initial_prediction = log(true_label_mean/(1-true_label_mean));
             for (int dp_index = 0; dp_index < dp_count; dp_index++) {
-                predictions.at(dp_index) = true_label_mean;
-                residuals.at(dp_index) = true_labels.at(dp_index) - true_label_mean;
+                predictions.at(dp_index) = initial_prediction;
+                residuals.at(dp_index) = true_labels.at(dp_index) - SIGMOID(initial_prediction);
             }
         }
 
@@ -231,6 +270,20 @@ class Dataset {
                 }
             }
 
+            labelled = true;
+            set_initial_prediction();
+            println("Set dataset initial predictions and residuals");
+        }
+
+        void label_custom1(const string& open, const string& close) {
+            if (!feature_index_to_name.contains(open) || !feature_index_to_name.contains(close)) {
+                println("Check the label columns you provided to label_custom1 :(");
+                exit(-1);
+            }
+            true_labels.resize(dp_count);
+            for (int dp_index = 0; dp_index < dp_count-1; dp_index++) {
+                true_labels.at(dp_index) = features.at(feature_index_to_name.at(close)).at(dp_index+1) - features.at(feature_index_to_name.at(open)).at(dp_index+1) > 0;
+            }
             labelled = true;
             set_initial_prediction();
             println("Set dataset initial predictions and residuals");
@@ -349,36 +402,50 @@ class Dataset {
             return test;
         }
 
-        pair<shared_ptr<Dataset>, shared_ptr<Dataset>> split_by_criteria(const IdealVariance& criteria) {
+        pair<shared_ptr<Dataset>, shared_ptr<Dataset>> split_by_criteria(shared_ptr<IdealVariance> criteria) {
+            // println("THe left side is {}, the criteria was {} for feature {}", criteria->left_count, criteria->chosen_threshold, criteria->chosen_feature);
             shared_ptr<Dataset> left  = make_shared<Dataset>(*this);
             shared_ptr<Dataset> right = make_shared<Dataset>(*this);
 
+            left->residuals.clear();
+            right->residuals.clear();
+
+            left->predictions.clear();
+            right->predictions.clear();
+
+            left->true_labels.clear();
+            right->true_labels.clear();
+
             left->features.resize(feature_count);
             right->features.resize(feature_count);
+            
             for (int f = 0; f < feature_count; f++) {
                 left->features[f].clear();
                 right->features[f].clear();
             }
 
-            left->true_labels.clear();
-            right->true_labels.clear();
-
-            for (int i = 0; i < dp_count; i++) {
-                if (features[criteria.chosen_feature][i] < criteria.chosen_threshold) {
+            for (int dp_index = 0; dp_index < dp_count; dp_index++) {
+                if (features.at(criteria->chosen_feature).at(dp_index) <= criteria->chosen_threshold) {
                     for (int f = 0; f < feature_count; f++) {
-                        left->features[f].push_back(features[f][i]);
+                        left->features[f].push_back(features[f][dp_index]);
                     }
-                    if (labelled) left->true_labels.push_back(true_labels[i]);
+                    if (labelled) left->true_labels.push_back(true_labels[dp_index]);
+                    left->residuals.push_back(residuals[dp_index]);
+                    left->predictions.push_back(predictions[dp_index]);
+
                 } else {
                     for (int f = 0; f < feature_count; f++) {
-                        right->features[f].push_back(features[f][i]);
+                        right->features[f].push_back(features[f][dp_index]);
                     }
-                    if (labelled) right->true_labels.push_back(true_labels[i]);
+                    if (labelled) right->true_labels.push_back(true_labels[dp_index]);
+                    right->residuals.push_back(residuals[dp_index]);
+                    right->predictions.push_back(predictions[dp_index]);
                 }
             }
 
             left->dp_count  = (int) left->features[0].size();
             right->dp_count = (int) right->features[0].size();
+            // println("Split it to two datasets with sizes {}, {}", left->dp_count,right->dp_count);
 
             return {std::move(left), std::move(right)};
         }
@@ -391,6 +458,25 @@ class Dataset {
                 apply_normalization();
             }
         }
+
+        float class_split() {
+            println("Warning: class split will not work on a regression model");
+            if (!labelled) {
+                println("You cannot calculate the class split on unlabelled data.");
+                exit(-1);
+            }
+
+            pair<int, int> up_down;
+            for (bool label : true_labels) {
+                if (label) {
+                    up_down.first++;
+                }
+                else {
+                    up_down.second++;
+                }
+            }
+            return (float)up_down.first / (float)up_down.second;
+        }
 };
 
 
@@ -398,68 +484,6 @@ struct Sum {
     double left = 0;
     double right = 0;
 };
-
-struct GradientBoosterMetadata {
-    float learning_rate;
-    int max_leaf_size;
-    int max_depth;
-    int num_trees;
-};
-
-class GradientBooster {
-    vector<shared_ptr<Node>> trees;
-    shared_ptr<Dataset> dataset;
-    
-    public:
-        float learning_rate;
-        int max_leaf_size;
-        int max_depth;
-        int num_trees;
-    
-        GradientBooster(const GradientBoosterMetadata& gbm, shared_ptr<Dataset> dataset): 
-            dataset(std::move(dataset)), 
-            learning_rate(gbm.learning_rate), 
-            max_leaf_size(gbm.max_leaf_size), 
-            max_depth(gbm.max_depth),
-            num_trees(gbm.num_trees)
-            {
-                println("Gradient Booster Initializing");
-        }
-
-        void generate(int current_tree_count = 1) {
-            shared_ptr<Node> current_tree = build_tree(*dataset, 1);
-            println("Built one tree");
-            trees.push_back(current_tree);
-            int feature_count = dataset->feature_count;
-            int dp_count = dataset->dp_count;
-
-            println("About to run data points through it");
-
-            for (int dp_index = 0; dp_index < dp_count; dp_index++) {
-               //   println("\n\nData point {:d} being evaluated", dp_index+1);
-                vector<double> features_temp(feature_count);
-                for (int feature_index = 0; feature_index < feature_count; feature_index++) {
-                    //println("About to access the data set at feature  {:d} of dp {:d}", feature_)
-                    features_temp.push_back(dataset->features.at(feature_index).at(dp_index));
-                }
-                // println("features for that one data point collected collected");
-                double leaf_value = traverse(*current_tree, features_temp);
-                //  println("===============\nTRAVERSED\n======================");
-                double new_prediction =  learning_rate*leaf_value;
-                dataset->predictions.at(dp_index) += new_prediction;
-                dataset->residuals.at(dp_index) = dataset->true_labels.at(dp_index) - new_prediction;
-            }
-            println("Evaluated data points at tree {:d}", current_tree_count);
-
-            if (current_tree_count == num_trees) {
-                return;
-            }
-
-            generate(current_tree_count+1);
-        }
-};
-
-// day 4, hour 15 + ,: amaz
 
 double traverse(Node& head, const vector<double>& features) {
     // println("traversing");
@@ -484,97 +508,381 @@ double traverse(Node& head, const vector<double>& features) {
 }
 
 
-IdealVariance findIdealVariance(Dataset& dataset) {
-    double chosen_threshold = -1;
-    int chosen_feature = -1;
-    double min_variance = numeric_limits<double>::max();
-    int dataset_size = dataset.dp_count;
-    int optimal_left_count = 0; // To keep track of left-count-vs-total later
+struct GradientBoosterMetadata {
+    float learning_rate;
+    int min_leaf_size;
+    int max_depth;
+    int num_trees;
+};
 
+struct TreeGenStats {
+    #define SCALAR(type, name) type name;
+    TREEGENSTATS_FIELDS
+    #undef SCALAR
 
-    // For each feature
+    string to_json(const string& pad = "  ") const {
+        vector<string> entries;
+        #define SCALAR(type, name) \
+            entries.push_back(pad + "  \"" #name "\": " + to_string(name));
+        TREEGENSTATS_FIELDS
+        #undef SCALAR
 
-    #pragma omp parallel for
-    for (int current_feature = 0; current_feature < dataset.feature_count; current_feature++) {
-        int left_count;
-        int right_count;
-        // println("Looking at feature {:d}", current_feature);
-        // Build a vector of indices of the datapoints sorted based on the current feature
-        
-        vector<pair<double, bool>> pairs(dataset.dp_count);
-        for (int i = 0; i < dataset.dp_count; i++) {
-            pairs[i] = {dataset.features.at(current_feature).at(i), dataset.residuals.at(i)};
+        string s = pad + "{\n";
+        for (size_t i = 0; i < entries.size(); i++) {
+            s += entries[i];
+            s += (i + 1 < entries.size()) ? ",\n" : "\n";
         }
-        sort(pairs.begin(), pairs.end());
+        return s + pad + "}";
+    }
+};
 
-        // print("[");
-        // for (pair pear : pairs) {
-        //     print("{:f}, ",  pear.first);
-        // }
-        // println("]");
+struct FeatureData {
+    #define VEC_SCALAR(type, name) vector<type> name;
+    FEATUREDATA_FIELDS
+    #undef VEC_SCALAR
 
-        // Label sums to calculate residuals
-        Sum labels;
-        Sum labels_squares;
-        // Sum it all pre-emptively and store in the right sum to allow for easy manipulation later
-        for (int temp = 0; temp < dataset.dp_count;  temp++) {
-            double value = pairs.at(temp).second;
-            labels.right += value;
-            labels_squares.right += value*value;
+    string to_json(const string& pad = "  ") const {
+        vector<string> entries;
+        #define VEC_SCALAR(type, name) {                        \
+            string arr = pad + "  \"" #name "\": [";           \
+            for (size_t i = 0; i < (name).size(); i++) {         \
+                arr += to_string((name)[i]);                     \
+                if (i + 1 < (name).size()) arr += ", ";          \
+            }                                                   \
+            entries.push_back(arr + "]");                      \
         }
+        FEATUREDATA_FIELDS
+        #undef VEC_SCALAR
 
-        for (int feature_split_index = 0; feature_split_index < dataset.dp_count; feature_split_index++) {
-            left_count = feature_split_index + 1;
-            right_count = dataset.dp_count - left_count;
+        string s = pad + "{\n";
+        for (size_t i = 0; i < entries.size(); i++) {
+            s += entries[i];
+            s += (i + 1 < entries.size()) ? ",\n" : "\n";
+        }
+        return s + pad + "}";
+    }
+};
 
-            // println("Splitting feature {:d} with {:d} on the left", current_feature, left_count);
+struct TrainingLog {
+    #define STRUCT_ARRAY(type, name)  vector<type> name;
+    #define NESTED_STRUCT(type, name) type name;
+    TRAININGLOG_FIELDS
+    #undef STRUCT_ARRAY
+    #undef NESTED_STRUCT
 
-            double value = pairs.at(feature_split_index).second;
-            labels.left += value;
-            labels.right -=  value;
-            labels_squares.left += value*value;
-            labels_squares.right -= value*value;
-            // Does this actually do anything?
-            if (left_count != dataset.dp_count && pairs[feature_split_index].first == pairs[feature_split_index+1].first) continue;
+    string to_json() const {
+        vector<string> entries;
 
-            double mean_of_squares_left = labels_squares.left / (left_count);
-            double square_of_means_left = SQUARE(labels.left / (left_count));
-            double total_variance_left = mean_of_squares_left - square_of_means_left;
+        #define STRUCT_ARRAY(type, name) {                          \
+            string arr = "  \"" #name "\": [\n";                   \
+            for (size_t i = 0; i < (name).size(); i++) {             \
+                arr += (name)[i].to_json("    ");                    \
+                arr += (i + 1 < (name).size()) ? ",\n" : "\n";      \
+            }                                                       \
+            entries.push_back(arr + "  ]");                        \
+        }
+        #define NESTED_STRUCT(type, name) \
+            entries.push_back("  \"" #name "\": " + (name).to_json("  "));
+        TRAININGLOG_FIELDS
+        #undef STRUCT_ARRAY
+        #undef NESTED_STRUCT
 
-            double total_variance_right = 0;
+        string s = "{\n";
+        for (size_t i = 0; i < entries.size(); i++) {
+            s += entries[i];
+            s += (i + 1 < entries.size()) ? ",\n" : "\n";
+        }
+        return s + "}\n";
+    }
+};
 
-            // If the index is at the last index, all of the values are in the left bucket
-            if (right_count != 0) {
-                double mean_of_squares_right = labels_squares.right / (right_count);
-                double square_of_means_right = SQUARE(labels.right / (right_count));
-                total_variance_right = mean_of_squares_right - square_of_means_right;
-            } 
-            // else {
-            //     println("End of feature {:d} (everything is in one category)", current_feature);
-            // }
+void write_training_log(const shared_ptr<TrainingLog>& log) {
+    ofstream out(LOG_FILE, ios::out | ios::trunc);
+    if (!out.is_open()) {
+        println("Failed to open log file: {}", LOG_FILE);
+        return;
+    }
+    out << log->to_json();
+    out.close();
+    println("Training log written to {}", LOG_FILE);
+}
 
-            double left_weight = (double) left_count / dataset.dp_count;
-            double right_weight = (double) right_count / dataset.dp_count;
 
-            double weighted_variance = (left_weight)*total_variance_left + (right_weight)*total_variance_right;
-            // println("({:f})({:f}) + ({:f})({:f})", left_weight,  total_variance_left, right_weight, total_variance_right);
-            #pragma omp critical
+class GradientBooster {
+    vector<shared_ptr<Node>> trees;
+    shared_ptr<Dataset> train_dataset;
+    shared_ptr<Dataset> test_dataset;
+    
+    public:
+        TrainingLog training_log;
+        float learning_rate;
+        int min_leaf_size;
+        int max_depth;
+        int num_trees;
+    
+        GradientBooster(const GradientBoosterMetadata& gbm, shared_ptr<Dataset> train_dataset, shared_ptr<Dataset> test_dataset): 
+            train_dataset(std::move(train_dataset)),
+            test_dataset(std::move(test_dataset)), 
+            learning_rate(gbm.learning_rate), 
+            min_leaf_size(gbm.min_leaf_size), 
+            max_depth(gbm.max_depth),
+            num_trees(gbm.num_trees)
             {
-                if (weighted_variance < min_variance) {
-                    optimal_left_count = left_count;
-                    min_variance = weighted_variance;
-                    chosen_threshold = pairs.at(feature_split_index).first;
-                    chosen_feature = current_feature;
+                println("Gradient Booster Initializing");
+        }
+
+        shared_ptr<Node> build_tree(Dataset& dataset, int tree_index, double variance, int current_depth=1) {
+            // Leaf base case
+            if (dataset.dp_count <= 2*min_leaf_size  || current_depth == MAX_DEPTH) { // ||  variance < 0.02
+
+                // Calculate the mean residual
+                double grad_sum = 0, hess_sum = 0;
+                for (int i = 0; i < dataset.dp_count; i++) {
+                    double p_i = SIGMOID(dataset.predictions.at(i));
+                    grad_sum += dataset.true_labels.at(i) - p_i;
+                    hess_sum += p_i * (1.0 - p_i);
+                }
+
+                double leaf_value = grad_sum / (hess_sum + LAMBDA);
+
+
+                training_log.tree_stats.at(tree_index).mean_leaf_value += leaf_value;
+                // println("Leaf value: {:f}, grad sum {:f}, dp count {:d}", leaf_value, grad_sum, dataset.dp_count);
+                // Increment leaf count for this tree
+                training_log.tree_stats.at(tree_index).num_leaves++;
+                // Make sure we record the deepest depth in the tree
+                if (current_depth > training_log.tree_stats.at(tree_index).depth) {
+                    training_log.tree_stats.at(tree_index).depth = current_depth;
+                }
+
+                return make_shared<Node>(
+                    Leaf{
+                        leaf_value
+                    }
+                );
+            }
+
+            // Find the ideal split and split the dataset
+            // println("FInding variance::=======\n");
+            shared_ptr<IdealVariance> ideal_variance = findIdealVariance(dataset);
+            // println("The variance has been found, column was {}", ideal_variance->chosen_feature);
+            training_log.feature_data.feature_importance.at(ideal_variance->chosen_feature)++;
+            training_log.tree_stats.at(tree_index).mean_variance += ideal_variance->total_weighted_variance;
+            // println("Ideal variance left size: {:f}", ideal_variance->left_count_vs_total);
+            auto [left_dataset, right_dataset] = dataset.split_by_criteria(ideal_variance);
+            // println("\n========Split by criteria found in variance");
+            //.println("The size of the left and right datasets is {:d} and {:d}", left_dataset->dp_count, right_dataset->dp_count);
+            // Build left and right trees based on their datasets
+            shared_ptr<Node> new_left = build_tree(*left_dataset, tree_index, ideal_variance->variances.first, current_depth+1);
+            shared_ptr<Node> new_right = build_tree(*right_dataset, tree_index, ideal_variance->variances.second, current_depth+1);
+
+            training_log.tree_stats.at(tree_index).num_decisions++;
+            shared_ptr<Node> new_decision = make_shared<Node>(
+                Decision { 
+                    (size_t)ideal_variance->chosen_feature,
+                    ideal_variance->chosen_threshold,
+                    new_left,
+                    new_right
+                }
+            );
+
+
+            return new_decision;    
+        }
+
+        void generate(int current_tree_count = 1) {
+            // Passing a big number as the initial variance so it definitely doesn't trigger the low-variance leaf creation
+            shared_ptr<Node> current_tree = build_tree(*train_dataset, current_tree_count-1, numeric_limits<double>::max(), 1); 
+
+            auto& stats = training_log.tree_stats.at(current_tree_count - 1);
+            if (stats.num_decisions > 0)
+                stats.mean_variance   /= stats.num_decisions;
+            if (stats.num_leaves > 0)
+                stats.mean_leaf_value /= stats.num_leaves;
+
+            // println("Built one tree\n");
+            trees.push_back(current_tree);
+            int feature_count = train_dataset->feature_count;
+            int dp_count = train_dataset->dp_count;
+            double MSE = 0;
+
+            //println("About to run data points through the tree at index {:d}", current_tree_count);
+            float running_accuracy = 0;
+            for (int dp_index = 0; dp_index < dp_count; dp_index++) {
+               //   println("\n\nData point {:d} being evaluated", dp_index+1);
+                vector<double> features_temp;
+                for (int feature_index = 0; feature_index < feature_count; feature_index++) {
+                    //println("About to access the data set at feature  {:d} of dp {:d}", feature_)
+                    features_temp.push_back(train_dataset->features.at(feature_index).at(dp_index));
+                }
+                // println("features for that one data point collected collected");
+                double leaf_value = traverse(*current_tree, features_temp);
+                // println("===============\nTRAVERSED and got {:f}\n======================", leaf_value);
+                double prediction_update = learning_rate*leaf_value;
+                // println("Log odd prediction updated from {:f} to {:f}", train_dataset->predictions.at(dp_index), train_dataset->predictions.at(dp_index)+prediction_update);
+                train_dataset->predictions.at(dp_index) += prediction_update;
+                double p_i = SIGMOID(train_dataset->predictions.at(dp_index));  // sigmoid
+                double residual = train_dataset->true_labels.at(dp_index) - p_i;
+                train_dataset->residuals.at(dp_index) = residual;
+                MSE += SQUARE(residual);
+                // !non-regression
+                if ((train_dataset->predictions.at(dp_index) >= 0.5 && (bool)(train_dataset->true_labels.at(dp_index))) || (train_dataset->predictions.at(dp_index) < 0.5 && !(bool)(train_dataset->true_labels.at(dp_index)))) {
+                    running_accuracy += 1;
+                }
+                //println("Updated the residual to {}", train_dataset->residuals.at(dp_index));
+                //appendToFile("log.txt", format());
+                // gradient
+                //train_dataset->residuals.at(dp_index) = train_dataset->true_labels.at(dp_index) - new_prediction;
+            }
+            running_accuracy /= (float)dp_count;
+            training_log.tree_stats.at(current_tree_count-1).running_accuracy = running_accuracy;
+            MSE /= dp_count;
+            stats.MSE = MSE;
+
+
+            println("Evaluated data points at tree {:d} ({}) ({})\n\n", current_tree_count, MSE, training_log.tree_stats.at(current_tree_count-1).mean_variance);
+
+            if (current_tree_count == num_trees) {
+                return;
+            }
+
+            generate(current_tree_count+1);
+        }
+
+        shared_ptr<TrainingLog> train() {
+            training_log.feature_data.feature_importance.resize(train_dataset->feature_count);
+            training_log.tree_stats.resize(num_trees);
+            // println("Generating");
+            generate();
+            return make_shared<TrainingLog>(training_log);
+        }
+
+        double infer(const vector<double>& features, double initial) {
+            double result = initial;
+            for (int tree_index = 0; tree_index < num_trees; tree_index++) {
+                result += traverse(*(trees.at(tree_index)), features);
+            }
+            return result;
+        }
+
+        double test() {
+            int correct_predictions = 0;
+            for (int dp_index = 0; dp_index < test_dataset->dp_count; dp_index++) {
+                vector<double> features(test_dataset->feature_count);
+                for (int j = 0; j < test_dataset->feature_count; j++) {
+                    features.at(j) = test_dataset->features.at(j).at(dp_index);
+                }
+                double inference = infer(features, test_dataset->initial_prediction);
+                double probability = SIGMOID(inference);
+                // !non-regression
+                if ((probability >= 0.5 && (bool)(test_dataset->true_labels.at(dp_index))) || (probability < 0.5 && !(bool)(test_dataset->true_labels.at(dp_index)))) {
+                    correct_predictions++;
+                }
+
+            }
+            return (double)correct_predictions/test_dataset->dp_count;
+        }
+
+        shared_ptr<IdealVariance> findIdealVariance(Dataset& dataset) {
+            int subset_size = max(1, (int)sqrt(dataset.feature_count));
+            
+            vector<int> feature_indices(dataset.feature_count);
+            iota(feature_indices.begin(), feature_indices.end(), 0);
+            shuffle(feature_indices.begin(), feature_indices.end(), default_random_engine{random_device{}()});
+            feature_indices.resize(subset_size);
+
+            double chosen_threshold = -1;
+            int chosen_feature = -1;
+            double min_variance = numeric_limits<double>::max();
+            int dataset_size = dataset.dp_count;
+            int optimal_left_count = 0;
+
+            double left_variance = 0;
+            double right_variance = 0;
+
+            if (dataset_size < 2 * min_leaf_size) {
+                println("Its a little small. This probably should have been caught earlier though");
+                exit(-1);
+            }
+
+            #pragma omp parallel for
+            for (int current_feature_index = 0; current_feature_index < subset_size; current_feature_index++) {
+                int current_feature = feature_indices.at(current_feature_index);
+                
+                vector<pair<double, double>> pairs(dataset.dp_count);
+                for (int i = 0; i < dataset.dp_count; i++) {
+                    pairs[i] = {dataset.features.at(current_feature).at(i), dataset.residuals.at(i)};
+                }
+                sort(pairs.begin(), pairs.end());
+
+                Sum labels;
+                Sum labels_squares;
+                for (int temp = 0; temp < dataset.dp_count; temp++) {
+                    double value = pairs.at(temp).second;
+                    labels.right += value;
+                    labels_squares.right += value * value;
+                }
+
+                //  Pre-fill the first (min_leaf_size - 1) elements
+                for (int i = 0; i < min_leaf_size - 1; i++) {
+                    double value = pairs.at(i).second;
+                    labels.left += value;
+                    labels.right -= value;
+                    labels_squares.left += value * value;
+                    labels_squares.right -= value * value;
+                }
+
+                // Only iterate through indices that satisfy both min_leaf_size constraints
+                // Start index: min_leaf_size - 1 (the index that results in min_leaf_size on left)
+                // End index: dataset_size - min_leaf_size - 1 (results in min_leaf_size on right)
+                for (int feature_split_index = min_leaf_size - 1; feature_split_index <= dataset_size - min_leaf_size; feature_split_index++) {
+                    int left_count = feature_split_index + 1;
+                    int right_count = dataset_size - left_count;
+
+                    double value = pairs.at(feature_split_index).second;
+                    labels.left += value;
+                    labels.right -= value;
+                    labels_squares.left += value * value;
+                    labels_squares.right -= value * value;
+
+                    // Skip identical feature values to prevent splitting between same numbers
+                    if (feature_split_index < dataset_size - 1 && pairs[feature_split_index].first == pairs[feature_split_index + 1].first) {
+                        continue;
+                    }
+
+                    double total_variance_left = (labels_squares.left / left_count) - SQUARE(labels.left / left_count);
+                    double total_variance_right = (labels_squares.right / right_count) - SQUARE(labels.right / right_count);
+
+                    double weighted_variance = ((double)left_count / dataset_size) * total_variance_left + 
+                                            ((double)right_count / dataset_size) * total_variance_right;
+
+                    #pragma omp critical
+                    {
+                        if (weighted_variance < min_variance) {
+                            optimal_left_count = left_count;
+                            min_variance = weighted_variance;
+                            chosen_threshold = pairs.at(feature_split_index).first;
+                            chosen_feature = current_feature;
+                            left_variance = total_variance_left;
+                            right_variance = total_variance_right;
+                        }
+                    }
                 }
             }
-            
 
-            
+            if (chosen_feature == -1) {
+                println("The dataset passed into findIdealVariance was too small or no valid splits found.");
+                exit(-1);
+            }
+
+            return make_shared<IdealVariance>(IdealVariance{chosen_feature, chosen_threshold, (float)optimal_left_count / (float)dataset_size, (int)optimal_left_count, min_variance, pair<double, double>(left_variance, right_variance)});
         }
-    }
-    // println("The minimum variance was feature {:d} @ {:f}", chosen_feature, chosen_threshold);
-    return IdealVariance{chosen_feature, chosen_threshold, (float)optimal_left_count/(float)dataset_size};
-}
+};
+
+// day 4, hour 15 + ,: amaz
+//  day 5?  perhaps 22:37
+
+
 
 template<typename F>
 auto loki(F lambda) {
@@ -599,53 +907,7 @@ int manual_tree_test() {
     return 1;
 }
 
-int variance_n_p_hp(int dp_count, int feature_count) {
-    unique_ptr<Dataset> dataset = make_unique<Dataset>(dp_count,feature_count);
-    dataset->label(5, 0.7);
-    auto [ideal_variance, time] = loki(
-        [&dataset]() {
-                 return findIdealVariance(*dataset);   
-        }
-    );
-    println("One variance on tree {:d} data points and {:d} features takes {:d}ms", dp_count, feature_count, time);
-    return 1;
-}
-
-shared_ptr<Node> build_tree(Dataset& dataset, int current_depth=1) {
-    // Leaf base case
-    if (dataset.dp_count < LEAF_SIZE || current_depth == MAX_DEPTH) {
-        // Calculate the mean residual
-        double current_mean_label = 0;
-        for (double residual : dataset.residuals) {
-            current_mean_label += residual;
-        }
-        current_mean_label /= dataset.dp_count;
-        return make_shared<Node>(
-            Leaf{ 
-                current_mean_label
-            }
-        );
-    }
-    // Find the ideal split and split the dataset
-    IdealVariance ideal_variance = findIdealVariance(dataset);
-    auto [left_dataset, right_dataset] = dataset.split_by_criteria(ideal_variance);
-
-    // Build left and right trees based on their datasets
-    shared_ptr<Node> new_left = build_tree(*left_dataset, current_depth+1);
-    shared_ptr<Node> new_right = build_tree(*right_dataset, current_depth+1);
-
-    shared_ptr<Node> new_decision = make_shared<Node>(
-        Decision { 
-            (size_t)ideal_variance.chosen_feature,
-            ideal_variance.chosen_threshold,
-            new_left,
-            new_right
-        }
-    );
-    return new_decision;    
-}
-
-int main() {
+int maine() {
 
     // double result = traverse(*head, features);
     // println("The result is {:g}", result);
@@ -657,9 +919,10 @@ int main() {
         return make_shared<Dataset>("data/fragmented/1.csv"); 
         }
     );
+
     println("Loading one dataset [:d ms]", time);
     
-    dataset->display_1(43571); 
+    //dataset->display_1(43571); 
 
     dataset->show_feature_names();
     // dataset->label_by_feature("Class");
@@ -670,10 +933,11 @@ int main() {
     println("Test dataset has {:d} datapoints", test_dataset->dp_count);
     println("OG dataset has {:d} ({:d}) datapoints", dataset->dp_count, dataset->features.at(0).size());
 
+
     dataset->combine(*test_dataset);
     println("Combined datasets");
     println("{:d}", dataset->dp_count);
-    dataset->display_1(78376);
+    //dataset->display_1(78376);
 
     float train_percent = 0.8;
     shared_ptr<Dataset> test_set = dataset->split(train_percent);
@@ -690,10 +954,16 @@ int main() {
     println("Normalized test dataset");
     test_set->display_1(15);
 
-    shared_ptr<Node> tree = build_tree(*dataset);
-    GradientBoosterMetadata md{0.01, 10, 3, 100};
-    GradientBooster gb(md, dataset);
-    gb.generate();
+    GradientBoosterMetadata md{LEARNING_RATE, LEAF_SIZE, MAX_DEPTH, NUM_TREES};
+    GradientBooster gb(md, dataset, test_set);
+    shared_ptr<TrainingLog> log = gb.train();
+    double accuracy = gb.test();
+    println("Accuracy: {:f}", accuracy);
+
+    ofstream outFile(LOG_FILE);
+    outFile << log->to_json();
+    outFile.close();
+
 
 
     // int class_index = dataset->feature_index_to_name.at("Class");
@@ -703,7 +973,64 @@ int main() {
     //         println("Wrong");
     //     }
     // }
+    return 0;
 }
 
+int mainee() {
+    auto [dataset, time] = loki(
+        [](){
+        return make_shared<Dataset>("data/sp500/data.csv"); 
+        }
+    );
+    println("Loading one dataset {:d} ms", time);
+    dataset->label_custom1("open", "close");
+
+    float train_percent = 0.8;
+    shared_ptr<Dataset> test_set = dataset->split(train_percent);
+
+    dataset->normalize();
+    test_set->normalization = dataset->normalization; 
+    test_set->normalize();
+
+    GradientBoosterMetadata md{0.01, 10, 5, 600};
+    GradientBooster gb(md, dataset, test_set);
+    shared_ptr<TrainingLog> log = gb.train();
+    double accuracy = gb.test();
+    println("Accuracy: {:f}", accuracy);
+
+    ofstream outFile(LOG_FILE);
+    outFile << log->to_json();
+    outFile.close();
+    return 0;
+}
 //int 
     // IdealVariance thebest = findIdealVariance(*dataset);
+
+int main() {
+    auto [dataset, time] = loki(
+        [](){
+        return make_shared<Dataset>("data/generic/CLEAN_AAPL_PREPARED.csv"); 
+        }
+    );
+    println("Loading one dataset {:d} ms", time);
+    dataset->label_custom1("Open", "Close(t)");
+    println("Class split: {}", dataset->class_split());
+
+    float train_percent = 0.99;
+    shared_ptr<Dataset> test_set = dataset->split(train_percent);
+
+    dataset->normalize();
+    test_set->normalization = dataset->normalization; 
+    test_set->normalize();
+
+    GradientBoosterMetadata md{LEARNING_RATE,LEAF_SIZE, MAX_DEPTH, NUM_TREES};
+    GradientBooster gb(md, dataset, test_set);
+    shared_ptr<TrainingLog> log = gb.train();
+    double accuracy = gb.test();
+    println("Accuracy: {:f}", accuracy);
+
+    ofstream outFile(LOG_FILE);
+    outFile << log->to_json();
+    outFile.close();
+    return 0;
+}
